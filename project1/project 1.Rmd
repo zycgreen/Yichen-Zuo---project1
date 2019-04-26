@@ -1,0 +1,555 @@
+---
+title: "AVITO DUPLICATE ADS DETECTION competition "
+output: word_document
+---
+
+```{r}
+# Yichen Zuo / Fangzhou Song / Mengqi Ji
+
+## Load Package
+library(tidyverse)
+library(data.table)
+library(geosphere)
+library(stringdist)
+library(xgboost)
+library(randomForest)
+library(MASS)
+library(ROCR)
+library(e1071)
+library(tree)
+library(fastAdaboost)
+library(gbm)
+library(rpart)
+set.seed(0)
+
+```
+
+
+```{r}
+## Load csv
+# setwd("C:/Avito Duplicate Ads Detection")
+
+Category=fread("Category.csv")
+Location=fread("Location.csv")
+ItemPairs_train=fread("ItemPairs_train.csv")
+ItemPairs_test=fread("ItemPairs_test.csv")
+ItemInfo_train=read_csv("ItemInfo_train.csv")
+ItemInfo_test=read_csv("ItemInfo_test.csv")
+
+ItemInfo_test=data.table(ItemInfo_test)
+ItemInfo_train=data.table(ItemInfo_train)
+
+```
+
+```{r}
+## Data wraggling
+#Location
+ItemInfo_train=ItemInfo_train %>% 
+  left_join(Location)
+
+ItemInfo_test=ItemInfo_test %>% 
+  left_join(Location)
+
+#Train
+train=ItemPairs_train %>% 
+  left_join(ItemInfo_train,by = c("itemID_1" = "itemID"))
+colnames(train)[5:15]=paste0(colnames(train)[5:15],"_1")
+
+train=train %>% 
+  left_join(ItemInfo_train,by = c("itemID_2" = "itemID"))
+colnames(train)[16:26]=paste0(colnames(train)[16:26],"_2")
+
+#Test
+test=ItemPairs_test %>% 
+  left_join(ItemInfo_test,by = c("itemID_1" = "itemID"))
+colnames(test)[4:14]=paste0(colnames(test)[4:14],"_1")
+
+test=test %>% 
+  left_join(ItemInfo_test,by = c("itemID_2" = "itemID"))
+colnames(test)[15:25]=paste0(colnames(test)[15:25],"_2")
+
+## Remove unnecessary dataset
+rm(list=c("Category", "Location", "ItemPairs_train","ItemPairs_test",
+          "ItemInfo_train","ItemInfo_test"))
+#
+train <- sample_frac(train,0.01)
+
+```
+
+```{r}
+test <- sample_frac(test,0.01)
+## Create features
+test=data.table(test)
+train=data.table(train)
+
+same_or_not=function(x,y){
+  ifelse(is.na(x)==FALSE & is.na(y)==FALSE, ifelse(x==y,1,-1),0)
+}
+# same is 1, not same is -1, have NA is 0
+
+#Add title-description distance
+add_t_d_dist=function(Item){
+  Item[,':='(
+    title_description_dist1_1=stringdist(Item$title_1, Item$description_1, method = "jw"),
+    title_description_dist1_2=stringdist(Item$title_2, Item$description_2, method = "jw"),
+    title_description_dist2_1=stringdist(Item$title_1, Item$description_1, method = "cosine"),
+    title_description_dist2_2=stringdist(Item$title_2, Item$description_2, method = "cosine"),
+    title_description_dist3_1=stringdist(Item$title_1, Item$description_1, method = "jaccard"),
+    title_description_dist3_2=stringdist(Item$title_2, Item$description_2, method = "jaccard")
+  )]
+  
+  Item[,':='(
+    title_description_dist1_1=ifelse(is.na(title_description_dist1_1)==TRUE,0,title_description_dist1_1),
+    title_description_dist1_2=ifelse(is.na(title_description_dist1_2)==TRUE,0,title_description_dist1_2),
+    title_description_dist2_1=ifelse(is.na(title_description_dist2_1)==TRUE,0,title_description_dist2_1),
+    title_description_dist2_2=ifelse(is.na(title_description_dist2_2)==TRUE,0,title_description_dist2_2),
+    title_description_dist3_1=ifelse(is.na(title_description_dist3_1)==TRUE,0,title_description_dist3_1),
+    title_description_dist3_2=ifelse(is.na(title_description_dist3_2)==TRUE,0,title_description_dist3_2)
+  )]
+}
+
+#Add num and nchar features
+# str_count - count 
+add_num_features=function(Item){
+  Item[,':='(
+    num_images_1=ifelse(is.na(images_array_1),0,str_count(images_array_1,",")+1),
+    num_images_2=ifelse(is.na(images_array_2),0,str_count(images_array_2,",")+1),
+    num_attrs_1=ifelse(is.na(attrsJSON_1),0,str_count(attrsJSON_1,",")+1),
+    num_attrs_2=ifelse(is.na(attrsJSON_2),0,str_count(attrsJSON_2,",")+1),
+    
+    nchartitle_1=ifelse(is.na(title_1)==TRUE,0,nchar(title_1)),
+    nchartitle_2=ifelse(is.na(title_2)==TRUE,0,nchar(title_2)),
+    nchardescription_1=ifelse(is.na(description_1)==TRUE,0,nchar(description_1)),
+    nchardescription_2=ifelse(is.na(description_2)==TRUE,0,nchar(description_2)),
+    ncharattrsJSON_1=ifelse(is.na(attrsJSON_1)==TRUE,0,nchar(attrsJSON_1)),
+    ncharattrsJSON_2=ifelse(is.na(attrsJSON_2)==TRUE,0,nchar(attrsJSON_2))
+    
+  )]
+}
+
+#Add match features
+add_match_features=function(Item){
+  Item[,':='(
+    location_match=same_or_not(locationID_1, locationID_2),
+    region_match=same_or_not(regionID_1, regionID_2),
+    metro_match=same_or_not(metroID_1, metroID_2),
+    price_match=same_or_not(price_1, price_2),
+    num_images_match=same_or_not(num_images_1,num_images_2),
+    num_attrs_match=same_or_not(num_attrs_1,num_attrs_2),
+    title_nchar_match=same_or_not(nchartitle_1,nchartitle_2),
+    description_nchar_match=same_or_not(nchardescription_1,nchardescription_2),
+    attrsJSON_nchar_match=same_or_not(ncharattrsJSON_1,ncharattrsJSON_2)
+    
+  )]
+}
+
+#Create compare model features
+create_features=function(Item){
+  Item[,':='(
+    #location
+    same_locationID=ifelse(location_match==1,locationID_1,0),
+    locationID_1=NULL,
+    locationID_2=NULL,
+    
+    #region
+    same_regionID=ifelse(region_match==1,regionID_1,0),
+    regionID_1=NULL,
+    regionID_2=NULL,
+    
+    #metro
+    same_metroID=ifelse(metro_match==1,metroID_1,0),
+    metroID_1=NULL,
+    metroID_2=NULL,
+    
+    categoryID_1 = NULL,
+    categoryID_2 = NULL,
+    
+    #price
+    same_price=ifelse(price_match==1,price_1,0),
+    price_diff=ifelse(price_match==0,0,abs(price_1-price_2)),
+    price_ratio=ifelse(price_match==0,0,pmin(price_1,price_2)/pmax(price_1,price_2)),
+    price_1=NULL,
+    price_2=NULL,
+    
+    #num of images
+    same_num_images=ifelse(num_images_match==1,num_images_1,0),
+    num_images_diff=abs(num_images_1-num_images_2),
+    num_images_ratio=ifelse(num_images_1==0&num_images_2==0,0,
+                            pmin(num_images_1,num_images_2)/pmax(num_images_1,num_images_2)),
+    images_array_1=NULL,
+    images_array_2=NULL,
+    num_images_1=NULL,
+    num_images_2=NULL,
+    
+    #num of attrs
+    same_num_attrs=ifelse(num_attrs_match==1,num_attrs_1,0),
+    num_attrs_diff=abs(num_attrs_1-num_attrs_2),
+    num_attrs_ratio=ifelse(num_attrs_1==0&num_attrs_2==0,0,
+                           pmin(num_attrs_1,num_attrs_2)/pmax(num_attrs_1,num_attrs_2)),
+    num_attrs_1=NULL,
+    num_attrs_2=NULL,
+    
+    #num of char of title
+    same_title_nchar=ifelse(title_nchar_match==1,nchartitle_1,0),
+    title_nchar_diff=abs(nchartitle_1-nchartitle_2),
+    title_nchar_ratio=ifelse(nchartitle_1==0&nchartitle_2==0,0,
+                             pmin(nchartitle_1,nchartitle_2)/pmax(nchartitle_1,nchartitle_2)),
+    nchartitle_1=NULL,
+    nchartitle_2=NULL,
+    
+    #num of char of description
+    same_description_nchar=ifelse(description_nchar_match==1,nchardescription_1,0),
+    description_nchar_diff=abs(nchardescription_1-nchardescription_2),
+    description_nchar_ratio=ifelse(nchardescription_1==0&nchardescription_2==0,0,
+                                   pmin(nchardescription_1,nchardescription_2)/pmax(nchardescription_1,nchardescription_2)),
+    nchardescription_1=NULL,
+    nchardescription_2=NULL,
+    
+    #num of char of attrsJSON
+    same_attrsJSON_nchar=ifelse(attrsJSON_nchar_match==1,ncharattrsJSON_1,0),
+    attrsJSON_nchar_diff=abs(ncharattrsJSON_1-ncharattrsJSON_2),
+    attrsJSON_nchar_ratio=ifelse(ncharattrsJSON_1==0&ncharattrsJSON_2==0,0,
+                                 pmin(ncharattrsJSON_1,ncharattrsJSON_2)/pmax(ncharattrsJSON_1,ncharattrsJSON_2)),
+    ncharattrsJSON_1=NULL,
+    ncharattrsJSON_2=NULL,
+    
+    #distance of title
+    title_dist1=stringdist(title_1, title_2, method = "jw"),
+    title_dist2=stringdist(title_1, title_2,method = "cosine"),
+    title_dist3=stringdist(title_1, title_2,method = "lv"),
+    title_dist4=stringdist(title_1, title_2,method = "jaccard"),
+    title_1=NULL,
+    title_2=NULL,
+    
+    #distance of description
+    description_dist1=stringdist(description_1, description_2, method = "jw"),
+    description_dist2=stringdist(description_1, description_2,method = "cosine"),
+    description_dist3=stringdist(description_1, description_2,method = "lv"),
+    description_dist4=stringdist(description_1, description_2,method = "jaccard"),
+    description_1=NULL,
+    description_2=NULL,
+    
+    #distance of attrsJSON
+    attrsJSON_dist1=stringdist(attrsJSON_1, attrsJSON_2, method = "jw"),
+    attrsJSON_dist2=stringdist(attrsJSON_1, attrsJSON_2,method = "cosine"),
+    attrsJSON_dist3=stringdist(attrsJSON_1, attrsJSON_2,method = "lv"),
+    attrsJSON_dist4=stringdist(attrsJSON_1, attrsJSON_2,method = "jaccard"),
+    attrsJSON_1=NULL,
+    attrsJSON_2=NULL,
+    
+    #title description dist compare
+    title_description_dist1_diff=abs(title_description_dist1_1-title_description_dist1_2),
+    title_description_dist1_ratio=ifelse(title_description_dist1_1==0&title_description_dist1_2==0,0,
+                                         pmin(title_description_dist1_1,title_description_dist1_2)/pmax(title_description_dist1_1,title_description_dist1_2)),
+    title_description_dist2_diff=abs(title_description_dist2_1-title_description_dist2_2),
+    title_description_dist2_ratio=ifelse(title_description_dist2_1==0&title_description_dist2_2==0,0,
+                                         pmin(title_description_dist2_1,title_description_dist2_2)/pmax(title_description_dist2_1,title_description_dist2_2)),
+    title_description_dist3_diff=abs(title_description_dist3_1-title_description_dist3_2),
+    title_description_dist3_ratio=ifelse(title_description_dist3_1==0&title_description_dist3_2==0,0,
+                                         pmin(title_description_dist3_1,title_description_dist3_2)/pmax(title_description_dist3_1,title_description_dist3_2)),
+    
+    
+    #geospatial distance
+    distance=distHaversine(cbind(lon_1,lat_1),cbind(lon_2,lat_2)),
+    lat_1=NULL,
+    lat_2=NULL,
+    lon_1=NULL,
+    lon_2=NULL,
+    
+    
+    itemID_1=NULL,
+    itemID_2=NULL
+  )]
+  
+  Item[,':='(
+    title_dist1=ifelse(is.na(title_dist1),0,title_dist1),
+    title_dist2=ifelse(is.na(title_dist2),0,title_dist2),
+    title_dist3=ifelse(is.na(title_dist3),0,title_dist3),
+    title_dist4=ifelse(is.na(title_dist4),0,title_dist4),
+    
+    description_dist1=ifelse(is.na(description_dist1),0,description_dist1),
+    description_dist2=ifelse(is.na(description_dist2),0,description_dist2),
+    description_dist3=ifelse(is.na(description_dist3),0,description_dist3),
+    description_dist4=ifelse(is.na(description_dist4),0,description_dist4),
+    
+    attrsJSON_dist1=ifelse(is.na(attrsJSON_dist1),0,attrsJSON_dist1),
+    attrsJSON_dist2=ifelse(is.na(attrsJSON_dist2),0,attrsJSON_dist2),
+    attrsJSON_dist3=ifelse(is.na(attrsJSON_dist3),0,attrsJSON_dist3),
+    attrsJSON_dist4=ifelse(is.na(attrsJSON_dist4),0,attrsJSON_dist4)
+  )]
+}
+
+```
+
+
+```{r}
+test=add_t_d_dist(test)
+train=add_t_d_dist(train)
+
+test=add_num_features(test)
+train=add_num_features(train)
+
+test=add_match_features(test)
+train=add_match_features(train)
+
+test=create_features(test)
+train=create_features(train)
+
+
+test = data.frame(test)
+train = data.frame(train)
+
+```
+
+```{r}
+train1<-train
+
+```
+
+```{r}
+# train and validation dataset
+modelVars = names(train1)[which(!(names(train1) %in% c("isDuplicate", "generationMethod", "foldId")))]
+
+train1$isDuplicate <-ifelse(train1$isDuplicate==1, 0,1)
+
+train_mat=train1 %>%
+  dplyr::select(-generationMethod) %>%
+  mutate(
+    isDuplicate=as.factor(isDuplicate)
+  )
+validation_id <- sample(nrow(train_mat),
+                        size = floor(nrow(train_mat)*.10),
+                        replace = FALSE)
+
+validation <- train_mat[validation_id,]
+train_1 <- train_mat[-validation_id,]
+
+```
+
+
+```{r}
+## select Models
+
+### 1.Logistic Regression
+
+model1 <- glm(isDuplicate ~ .,data=train_1,family="binomial")
+
+model1_pred <- model1 %>% 
+  predict(validation,type="response") %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model1_pred,"auc")@y.values[[1]] 
+
+```
+
+
+```{r}
+### 2.LDA
+
+model2 <- lda(isDuplicate~.,data = train_1)
+
+model2_pred <- model2 %>% 
+  predict(validation) %>% 
+  (function(x) x$posterior[,2]) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model2_pred,"auc")@y.values[[1]] 
+
+```
+
+```{r}
+### 3.QDA
+
+model3 <- qda(isDuplicate~.,data = train_1)
+
+model3_pred <- model3 %>% 
+  predict(validation) %>% 
+  (function(x) x$posterior[,2]) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model3_pred,"auc")@y.values[[1]] 
+
+```
+
+```{r}
+### 4.Random Forest
+##Train
+model4=randomForest(isDuplicate~.,data = train_1,ntree=300)
+
+model4_pred=prediction(predict(model4,newdata = validation,type = "prob")[,2],
+                           validation$isDuplicate)
+performance(model4_pred,"auc")@y.values[[1]]
+
+```
+
+```{r}
+# 5.Xgboost
+#temp_ctrl <- trainControl(method = "repeatedcv", number=5)
+
+#temp_grid <- expand.grid(nrounds = seq(25,55,10),
+#                         eta = c(0.09,0.1,0.11,0.3,0.5,0.7,0.9,1),
+#                         max_depth = c(7,8,13,36),
+#                         gamma=c(0,2,4,7,9),
+#                         colsample_bytree=c(0.75,0.8,0.85),
+#                         min_child_weight=c(38,47,50),
+#                         subsample=c(0.75,0.8,0.85)
+#)
+
+#temp_tune <-train(isDuplicate~.,
+#                  data = train_1,
+#                  method = "xgbTree",
+#                  trControl = temp_ctrl,
+#                  tuneGrid = temp_grid,
+#                  verbose = FALSE,
+#                  metric = "Accuracy",
+#                  nthread = 3
+#)
+
+#xgb_tune
+#plot(xgb_tune)
+
+```
+
+
+```{r}
+maxTrees <- 200
+shrinkage <- 0.10
+gamma <- 1
+depth <- 10
+minChildWeight <- 40
+colSample <- 0.85
+subSample <- 0.85
+earlyStopRound <- 4
+
+d_train <- train_1 %>% 
+  select(-isDuplicate) %>% 
+  as.matrix %>% 
+  xgb.DMatrix(label=train_1$isDuplicate)
+
+d_validation <- validation %>% 
+  select(-isDuplicate) %>% 
+  as.matrix %>% 
+  xgb.DMatrix(label=validation$isDuplicate)
+
+d_test <- test %>% 
+  select(-isDuplicate) %>% 
+  as.matrix %>% 
+  xgb.DMatrix(label=test$isDuplicate)
+
+model_xgb <- xgboost(params=list(max_depth=depth,
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_bytree=colSample,
+                                 min_child_weight=minChildWeight),
+                     data=d_train,
+                     nrounds=90,
+                     objective="binary:logistic",
+                     eval_metric="auc")
+
+model_xgb_pred <- predict(model_xgb, d_validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model_xgb_pred,"auc")@y.values[[1]]
+
+```
+
+```{r}
+### 6.1 SVM- linear kernel
+model6a <- svm(isDuplicate~.,data=train_1,scale = TRUE,
+               method="C-classifcation",cost=10,kernel="linear")
+
+model6a_pred <- model6a %>% 
+  predict(validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model6a_pred,"auc")@y.values[[1]]
+```
+
+
+```{r}
+## Polynomial Kernel
+model6b <- svm(isDuplicate~.,data=train_1,scale = TRUE,
+               method="C-classifcation",cost=10,kernel="polynomial")
+
+model6b_pred <- model6b %>% 
+  predict(validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model6b_pred,"auc")@y.values[[1]]
+```
+
+```{r}
+## Radial Kernel
+model6c <- svm(isDuplicate~.,data=train_1,scale = TRUE,
+               method="C-classifcation",cost=10,kernel="radial")
+
+model6c_pred <- model6c %>% 
+  predict(validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model6c_pred,"auc")@y.values[[1]]
+```
+
+```{r}
+#svm_radial_tune <- tune(svm, 
+#                        isDuplicate~.,
+#                        data=train_1,
+#                        kernel="radial",
+#                        ranges=list(cost=c(0.1,1,10,100,1000),
+#                                    gamma=c(0.1,0.5,1,2,4,8,16)))
+#summary(tune.out_radial)
+
+#we choose cost=10 and gamma=4
+
+#model4cc <-svm(isDuplicate~.,
+#               data = train_1, scale = TRUE,
+#               method="C-classifcation",kernel="radial",cost=10,gamma=4)
+
+#model4cc_pred <- model4cc %>% 
+#  predict(validation) %>% 
+#  prediction(labels=validation$isDuplicate)
+
+#performance(model4cc_pred,"auc")@y.values[[1]]
+
+```
+
+```{r}
+### 8.Gradient Boosting
+model8 <- gbm(isDuplicate~.,distribution = "bernoulli",data=train_1,
+            n.trees = 400,
+            interaction.depth = 8)
+
+model8_pred=prediction(predict(model8, newdata=validation,n.trees = 400,type =
+                                 "response"),
+                       validation$isDuplicate)
+
+performance(model8b_pred,"auc")@y.values[[1]]
+
+```
+
+```{r}
+### 9.Adaboost
+model9=adaboost(isDuplicate~.,train_1,10)
+
+model9_pred=prediction(predict(model8, validation)$prob[,2],
+                             validation$isDuplicate)
+
+performance(model9_pred,"auc")@y.values[[1]]
+
+```
+
+```{r}
+#Final step
+# Test - choosing the Xgboost
+model_xgb_pred <- predict(model_xgb, d_test) %>% 
+  prediction(labels=test$isDuplicate)
+
+performance(model_xgb_pred,"auc")@y.values[[1]]
+
+```
+
+
+
+
+
+
